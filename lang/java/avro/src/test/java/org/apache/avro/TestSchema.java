@@ -17,7 +17,12 @@
  */
 package org.apache.avro;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -33,7 +38,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-
 import org.apache.avro.Schema.Field;
 import org.apache.avro.Schema.Type;
 import org.apache.avro.generic.GenericData;
@@ -430,5 +434,113 @@ public class TestSchema {
     parser.setValidate(true);
     parser.setValidateDefaults(true);
     assertThrows(SchemaParseException.class, () -> parser.parse(avscFile));
+  }
+
+  @Test
+  public void testSelfReferencingSchemaWithDefault() {
+    // Exhibit B from bug report: single self-referencing field with default should
+    // now parse
+    String schemaWithDefault = "{\n" + "  \"name\": \"UnionHolder\",\n" + "  \"type\": \"record\",\n"
+        + "  \"fields\": [\n" + "    {\n" + "      \"name\": \"value\",\n" + "      \"type\": [\n" + "        {\n"
+        + "          \"name\": \"Foo\",\n" + "          \"type\": \"record\",\n" + "          \"fields\": [\n"
+        + "            {\n" + "              \"name\": \"fooChildMaybe\",\n" + "              \"type\": {\n"
+        + "                \"name\": \"OptionalUnionHolder\",\n" + "                \"type\": \"record\",\n"
+        + "                \"fields\": [\n" + "                  {\n" + "                    \"name\": \"value\",\n"
+        + "                    \"type\": [\n" + "                      \"null\",\n" + "                      \"Foo\",\n"
+        + "                      {\n" + "                        \"name\": \"Bar\",\n"
+        + "                        \"type\": \"record\",\n" + "                        \"fields\": [\n"
+        + "                          {\n" + "                            \"name\": \"barChildMaybe\",\n"
+        + "                            \"default\": {\n" + "                              \"value\": null\n"
+        + "                            },\n" + "                            \"type\": \"OptionalUnionHolder\"\n"
+        + "                          }\n" + "                        ]\n" + "                      }\n"
+        + "                    ]\n" + "                  }\n" + "                ]\n" + "              }\n"
+        + "            }\n" + "          ]\n" + "        },\n" + "        \"Bar\"\n" + "      ]\n" + "    }\n" + "  ]\n"
+        + "}";
+
+    Schema.Parser parser = new Schema.Parser();
+    parser.setValidateDefaults(true);
+    Schema schema = parser.parse(schemaWithDefault);
+    assertNotNull(schema);
+  }
+
+  @Test
+  public void testSelfReferencingSchemaWithoutDefault() {
+    // Exhibit A from bug report: original schema without default (baseline)
+    String schemaWithoutDefault = "{\n" + "  \"name\": \"UnionHolder\",\n" + "  \"type\": \"record\",\n"
+        + "  \"fields\": [\n" + "    {\n" + "      \"name\": \"value\",\n" + "      \"type\": [\n" + "        {\n"
+        + "          \"name\": \"Foo\",\n" + "          \"type\": \"record\",\n" + "          \"fields\": [\n"
+        + "            {\n" + "              \"name\": \"fooChildMaybe\",\n" + "              \"type\": {\n"
+        + "                \"name\": \"OptionalUnionHolder\",\n" + "                \"type\": \"record\",\n"
+        + "                \"fields\": [\n" + "                  {\n" + "                    \"name\": \"value\",\n"
+        + "                    \"type\": [\n" + "                      \"null\",\n" + "                      \"Foo\",\n"
+        + "                      {\n" + "                        \"name\": \"Bar\",\n"
+        + "                        \"type\": \"record\",\n" + "                        \"fields\": [\n"
+        + "                          {\n" + "                            \"name\": \"barChildMaybe\",\n"
+        + "                            \"type\": \"OptionalUnionHolder\"\n" + "                          }\n"
+        + "                        ]\n" + "                      }\n" + "                    ]\n"
+        + "                  }\n" + "                ]\n" + "              }\n" + "            }\n" + "          ]\n"
+        + "        },\n" + "        \"Bar\"\n" + "      ]\n" + "    }\n" + "  ]\n" + "}";
+
+    Schema.Parser parser = new Schema.Parser();
+    parser.setValidateDefaults(true);
+    Schema schema = parser.parse(schemaWithoutDefault);
+    assertNotNull(schema);
+  }
+
+  @Test
+  public void testSelfReferencingSchemaMultipleDefaults() {
+    // Test with multiple self-referencing fields with defaults - similar to bug
+    // report scenarios
+    String schemaMultipleDefaults = "{\n" + "  \"name\": \"LinkedList\",\n" + "  \"type\": \"record\",\n"
+        + "  \"fields\": [\n" + "    {\n" + "      \"name\": \"value\",\n" + "      \"type\": \"int\"\n" + "    },\n"
+        + "    {\n" + "      \"name\": \"next\",\n" + "      \"type\": [\"null\", \"LinkedList\"],\n"
+        + "      \"default\": null\n" + "    },\n" + "    {\n" + "      \"name\": \"metadata\",\n"
+        + "      \"type\": {\n" + "        \"name\": \"NodeMetadata\",\n" + "        \"type\": \"record\",\n"
+        + "        \"fields\": [\n" + "          {\n" + "            \"name\": \"parent\",\n"
+        + "            \"type\": [\"null\", \"LinkedList\"],\n" + "            \"default\": null\n" + "          }\n"
+        + "        ]\n" + "      }\n" + "    }\n" + "  ]\n" + "}";
+
+    Schema.Parser parser = new Schema.Parser();
+    parser.setValidateDefaults(true);
+    Schema schema = parser.parse(schemaMultipleDefaults);
+    assertNotNull(schema);
+  }
+
+  @Test
+  public void testSelfReferencingSchemaWithInvalidDefault() {
+    // Test that invalid defaults are still caught after deferral
+    String schemaInvalidDefault = "{\n" + "  \"name\": \"Node\",\n" + "  \"type\": \"record\",\n" + "  \"fields\": [\n"
+        + "    {\n" + "      \"name\": \"value\",\n" + "      \"type\": \"int\"\n" + "    },\n" + "    {\n"
+        + "      \"name\": \"next\",\n" + "      \"type\": [\"null\", \"Node\"],\n"
+        + "      \"default\": {\"value\": \"not_an_int\"}\n" + "    }\n" + "  ]\n" + "}";
+
+    Schema.Parser parser = new Schema.Parser();
+    parser.setValidateDefaults(true);
+    assertThrows(AvroTypeException.class, () -> parser.parse(schemaInvalidDefault));
+  }
+
+  @Test
+  public void testSelfReferencingSchemaValidationDisabled() {
+    // Test that setValidateDefaults(false) still works
+    String schemaWithDefault = "{\n" + "  \"name\": \"Node\",\n" + "  \"type\": \"record\",\n" + "  \"fields\": [\n"
+        + "    {\n" + "      \"name\": \"value\",\n" + "      \"type\": \"int\"\n" + "    },\n" + "    {\n"
+        + "      \"name\": \"next\",\n" + "      \"type\": [\"null\", \"Node\"],\n"
+        + "      \"default\": {\"value\": 42}\n" + "    }\n" + "  ]\n" + "}";
+
+    Schema.Parser parser = new Schema.Parser();
+    parser.setValidateDefaults(false);
+    Schema schema = parser.parse(schemaWithDefault);
+    assertNotNull(schema);
+  }
+
+  @Test
+  public void testBigSchemaWithManyDefaults() throws Exception {
+    // Test parsing a large real-world schema with 296+ defaults
+    // This is a stress test for the deferred validation performance optimization
+    Schema.Parser parser = new Schema.Parser();
+    parser.setValidateDefaults(true);
+    Schema schema = parser.parse(new File("src/test/resources/BigSchema.avsc"));
+    assertNotNull(schema);
+    assertEquals("BulkFilterEvaluationResultsResponse", schema.getName());
   }
 }

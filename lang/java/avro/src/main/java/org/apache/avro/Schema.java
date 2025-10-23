@@ -17,6 +17,8 @@
  */
 package org.apache.avro;
 
+import static org.apache.avro.LogicalType.LOGICAL_TYPE_PROP;
+
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.core.JsonParseException;
@@ -25,7 +27,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.DoubleNode;
 import com.fasterxml.jackson.databind.node.NullNode;
-
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
@@ -54,8 +55,6 @@ import org.apache.avro.util.internal.JacksonUtils;
 import org.apache.avro.util.internal.ThreadLocalWithInitial;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import static org.apache.avro.LogicalType.LOGICAL_TYPE_PROP;
 
 /**
  * An abstract data type.
@@ -1376,6 +1375,23 @@ public abstract class Schema extends JsonProperties implements Serializable {
   }
 
   /**
+   * Holds information about a field default that needs validation after the
+   * complete schema is parsed. Used for self-referential schemas where the
+   * field's type may not be fully initialized during parsing.
+   */
+  private static class DeferredValidation {
+    final String fieldName;
+    final Schema fieldSchema;
+    final JsonNode defaultValue;
+
+    DeferredValidation(String fieldName, Schema fieldSchema, JsonNode defaultValue) {
+      this.fieldName = fieldName;
+      this.fieldSchema = fieldSchema;
+      this.defaultValue = defaultValue;
+    }
+  }
+
+  /**
    * A parser for JSON-format schemas. Each named schema parsed with a parser is
    * added to the names known to the parser so that subsequently parsed schemas
    * may refer to it by name.
@@ -1384,6 +1400,8 @@ public abstract class Schema extends JsonProperties implements Serializable {
     private Names names = new Names();
     private boolean validate = true;
     private boolean validateDefaults = true;
+    private final List<DeferredValidation> deferredValidations = new ArrayList<>();
+    private final Set<Schema> incompleteRecords = Collections.newSetFromMap(new IdentityHashMap<>());
 
     /**
      * Adds the provided types to the set of defined, named types known to this
@@ -1468,7 +1486,19 @@ public abstract class Schema extends JsonProperties implements Serializable {
         validateNames.set(validate);
         VALIDATE_DEFAULTS.set(validateDefaults);
         JsonNode jsonNode = MAPPER.readTree(parser);
-        Schema schema = Schema.parse(jsonNode, names);
+
+        deferredValidations.clear();
+        incompleteRecords.clear();
+
+        Schema schema = validateDefaults ? Schema.parse(jsonNode, names, deferredValidations, incompleteRecords)
+            : Schema.parse(jsonNode, names);
+
+        if (validateDefaults && !deferredValidations.isEmpty()) {
+          for (DeferredValidation deferred : deferredValidations) {
+            validateDefault(deferred.fieldName, deferred.fieldSchema, deferred.defaultValue);
+          }
+        }
+
         if (!allowDanglingContent) {
           String dangling;
           StringWriter danglingWriter = new StringWriter();
@@ -1686,8 +1716,42 @@ public abstract class Schema extends JsonProperties implements Serializable {
     }
   }
 
+  private static boolean containsIncompleteRecord(Schema schema, Set<Schema> incompleteRecords) {
+
+    switch (schema.getType()) {
+    case RECORD:
+      return incompleteRecords.contains(schema);
+    case ARRAY:
+      return containsIncompleteRecord(schema.getElementType(), incompleteRecords);
+    case MAP:
+      return containsIncompleteRecord(schema.getValueType(), incompleteRecords);
+    case UNION:
+      for (Schema type : schema.getTypes()) {
+        if (containsIncompleteRecord(type, incompleteRecords)) {
+          return true;
+        }
+      }
+      return false;
+    default:
+      return false;
+    }
+  }
+
   /** @see #parse(String) */
   static Schema parse(JsonNode schema, Names names) {
+    return parse(schema, names, null, null);
+  }
+
+  /**
+   * Parse a schema with optional deferred validation tracking.
+   *
+   * @param deferredValidations if not null, incomplete record defaults will be
+   *                            added here for later validation
+   * @param incompleteRecords   if not null, tracks records that haven't had their
+   *                            fields set yet
+   */
+  static Schema parse(JsonNode schema, Names names, List<DeferredValidation> deferredValidations,
+      Set<Schema> incompleteRecords) {
     if (schema == null) {
       throw new SchemaParseException("Cannot parse <null> schema");
     }
@@ -1719,8 +1783,13 @@ public abstract class Schema extends JsonProperties implements Serializable {
       } else if (isTypeRecord || isTypeError) { // record
         List<Field> fields = new ArrayList<>();
         result = new RecordSchema(name, doc, isTypeError);
-        if (name != null)
+        if (name != null) {
           names.add(result);
+          // Track this record as incomplete until fields are set
+          if (incompleteRecords != null) {
+            incompleteRecords.add(result);
+          }
+        }
         JsonNode fieldsNode = schema.get("fields");
         if (fieldsNode == null || !fieldsNode.isArray())
           throw new SchemaParseException("Record has no fields: " + schema);
@@ -1733,7 +1802,7 @@ public abstract class Schema extends JsonProperties implements Serializable {
           if (fieldTypeNode.isTextual() && names.get(fieldTypeNode.textValue()) == null)
             throw new SchemaParseException(fieldTypeNode + " is not a defined name." + " The type of the \"" + fieldName
                 + "\" field must be a defined name or a {\"type\": ...} expression.");
-          Schema fieldSchema = parse(fieldTypeNode, names);
+          Schema fieldSchema = parse(fieldTypeNode, names, deferredValidations, incompleteRecords);
           Field.Order order = Field.Order.ASCENDING;
           JsonNode orderNode = field.get("order");
           if (orderNode != null)
@@ -1743,7 +1812,16 @@ public abstract class Schema extends JsonProperties implements Serializable {
               && (Type.FLOAT.equals(fieldSchema.getType()) || Type.DOUBLE.equals(fieldSchema.getType()))
               && defaultValue.isTextual())
             defaultValue = new DoubleNode(Double.valueOf(defaultValue.textValue()));
-          Field f = new Field(fieldName, fieldSchema, fieldDoc, defaultValue, true, order);
+
+          // Check if we need to defer validation for self-referential schemas
+          boolean shouldValidate = true;
+          if (defaultValue != null && deferredValidations != null && incompleteRecords != null
+              && containsIncompleteRecord(fieldSchema, incompleteRecords)) {
+            deferredValidations.add(new DeferredValidation(fieldName, fieldSchema, defaultValue));
+            shouldValidate = false;
+          }
+
+          Field f = new Field(fieldName, fieldSchema, fieldDoc, defaultValue, shouldValidate, order);
           Iterator<String> i = field.fieldNames();
           while (i.hasNext()) { // add field props
             String prop = i.next();
@@ -1758,6 +1836,10 @@ public abstract class Schema extends JsonProperties implements Serializable {
                 name, fieldName, getOptionalText(field, "logicalType"));
         }
         result.setFields(fields);
+        // Mark this record as complete now that fields are set
+        if (incompleteRecords != null) {
+          incompleteRecords.remove(result);
+        }
       } else if (isTypeEnum) { // enum
         JsonNode symbolsNode = schema.get("symbols");
         if (symbolsNode == null || !symbolsNode.isArray())
@@ -1776,12 +1858,12 @@ public abstract class Schema extends JsonProperties implements Serializable {
         JsonNode itemsNode = schema.get("items");
         if (itemsNode == null)
           throw new SchemaParseException("Array has no items type: " + schema);
-        result = new ArraySchema(parse(itemsNode, names));
+        result = new ArraySchema(parse(itemsNode, names, deferredValidations, incompleteRecords));
       } else if (type.equals("map")) { // map
         JsonNode valuesNode = schema.get("values");
         if (valuesNode == null)
           throw new SchemaParseException("Map has no values type: " + schema);
-        result = new MapSchema(parse(valuesNode, names));
+        result = new MapSchema(parse(valuesNode, names, deferredValidations, incompleteRecords));
       } else if (isTypeFixed) { // fixed
         JsonNode sizeNode = schema.get("size");
         if (sizeNode == null || !sizeNode.isInt())
@@ -1820,7 +1902,7 @@ public abstract class Schema extends JsonProperties implements Serializable {
     } else if (schema.isArray()) { // union
       LockableArrayList<Schema> types = new LockableArrayList<>(schema.size());
       for (JsonNode typeNode : schema)
-        types.add(parse(typeNode, names));
+        types.add(parse(typeNode, names, deferredValidations, incompleteRecords));
       return new UnionSchema(types);
     } else {
       throw new SchemaParseException("Schema not yet supported: " + schema);
