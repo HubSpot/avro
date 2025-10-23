@@ -497,6 +497,9 @@
                 <exclude>lang/java/tools/src/main/resources/META-INF/mpl-2.0.text</exclude>
                 <!-- Other -->
                 <exclude>lang/py/avro/py.typed</exclude> <!-- Included in package but contains no code (see PEP561)  -->
+                <!-- HubSpot -->
+                <exclude>.blazar-enabled</exclude>
+                <exclude>**/.blazar.yaml</exclude>
               </excludes>
             </configuration>
           </plugin>

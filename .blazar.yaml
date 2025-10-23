@@ -1,0 +1,6 @@
+buildpack:
+  name: Blazar-Buildpack-Java-oss-fork
+
+env:
+  MAVEN_BUILD_ARGS: -pl lang/java/avro
+  SKIP_VERSION_OVERRIDE: true
