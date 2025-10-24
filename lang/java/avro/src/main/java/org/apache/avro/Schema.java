@@ -1981,12 +1981,26 @@ public abstract class Schema extends JsonProperties implements Serializable {
     if (aliases.size() == 0 && fieldAliases.size() == 0)
       return writer; // no aliases
 
+    // Initialize deferred validation infrastructure
+    List<DeferredValidation> deferredValidations = new ArrayList<>();
+    Set<Schema> incompleteRecords = Collections.newSetFromMap(new IdentityHashMap<>());
+
     seen.clear();
-    return applyAliases(writer, seen, aliases, fieldAliases);
+    Schema result = applyAliases(writer, seen, aliases, fieldAliases, deferredValidations, incompleteRecords);
+
+    // Validate all deferred fields after schema construction completes
+    if (!deferredValidations.isEmpty()) {
+      for (DeferredValidation deferred : deferredValidations) {
+        validateDefault(deferred.fieldName, deferred.fieldSchema, deferred.defaultValue);
+      }
+    }
+
+    return result;
   }
 
   private static Schema applyAliases(Schema s, Map<Schema, Schema> seen, Map<Name, Name> aliases,
-      Map<Name, Map<String, String>> fieldAliases) {
+      Map<Name, Map<String, String>> fieldAliases, List<DeferredValidation> deferredValidations,
+      Set<Schema> incompleteRecords) {
 
     Name name = s instanceof NamedSchema ? ((NamedSchema) s).name : null;
     Schema result = s;
@@ -1998,34 +2012,50 @@ public abstract class Schema extends JsonProperties implements Serializable {
         name = aliases.get(name);
       result = Schema.createRecord(name.full, s.getDoc(), null, s.isError());
       seen.put(s, result);
+
+      // Track this record as incomplete until fields are set
+      incompleteRecords.add(result);
+
       List<Field> newFields = new ArrayList<>();
       for (Field f : s.getFields()) {
-        Schema fSchema = applyAliases(f.schema, seen, aliases, fieldAliases);
+        Schema fSchema = applyAliases(f.schema, seen, aliases, fieldAliases, deferredValidations, incompleteRecords);
         String fName = getFieldAlias(name, f.name, fieldAliases);
-        Field newF = new Field(fName, fSchema, f.doc, f.defaultValue, true, f.order);
+
+        // Check if we need to defer validation for self-referential schemas
+        boolean shouldValidate = true;
+        if (f.defaultValue() != null && containsIncompleteRecord(fSchema, incompleteRecords)) {
+          deferredValidations.add(new DeferredValidation(fName, fSchema, f.defaultValue()));
+          shouldValidate = false;
+        }
+
+        Field newF = new Field(fName, fSchema, f.doc, f.defaultValue(), shouldValidate, f.order);
         newF.putAll(f); // copy props
         newFields.add(newF);
       }
       result.setFields(newFields);
+
+      // Mark this record as complete now that fields are set
+      incompleteRecords.remove(result);
+
       break;
     case ENUM:
       if (aliases.containsKey(name))
         result = Schema.createEnum(aliases.get(name).full, s.getDoc(), null, s.getEnumSymbols(), s.getEnumDefault());
       break;
     case ARRAY:
-      Schema e = applyAliases(s.getElementType(), seen, aliases, fieldAliases);
+      Schema e = applyAliases(s.getElementType(), seen, aliases, fieldAliases, deferredValidations, incompleteRecords);
       if (!e.equals(s.getElementType()))
         result = Schema.createArray(e);
       break;
     case MAP:
-      Schema v = applyAliases(s.getValueType(), seen, aliases, fieldAliases);
+      Schema v = applyAliases(s.getValueType(), seen, aliases, fieldAliases, deferredValidations, incompleteRecords);
       if (!v.equals(s.getValueType()))
         result = Schema.createMap(v);
       break;
     case UNION:
       List<Schema> types = new ArrayList<>();
       for (Schema branch : s.getTypes())
-        types.add(applyAliases(branch, seen, aliases, fieldAliases));
+        types.add(applyAliases(branch, seen, aliases, fieldAliases, deferredValidations, incompleteRecords));
       result = Schema.createUnion(types);
       break;
     case FIXED:
