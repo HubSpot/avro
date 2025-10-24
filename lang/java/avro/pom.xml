@@ -28,7 +28,7 @@
   </parent>
 
   <artifactId>avro</artifactId>
-  <version>1.11.4-hubspot-SNAPSHOT</version>
+  <version>1.11.4-hubspot-default-validation-deferral-SNAPSHOT</version>
 
   <name>Apache Avro</name>
   <url>https://avro.apache.org</url>
