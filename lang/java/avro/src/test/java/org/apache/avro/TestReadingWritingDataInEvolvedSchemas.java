@@ -19,6 +19,7 @@ package org.apache.avro;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -27,6 +28,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericData.EnumSymbol;
 import org.apache.avro.generic.GenericData.Record;
@@ -402,6 +404,59 @@ public class TestReadingWritingDataInEvolvedSchemas {
     GenericData.Record decoded = decodeGenericBlob(reader, reader, encoded);
 
     assertEquals(1, decoded.get("fname"));
+  }
+
+  @Test
+  public void aliasesAndDefaultsInSelfReferencingSchema() throws Exception {
+    Schema writer = SchemaBuilder.record("UnionHolder") // R1
+      .fields() //
+        .name("value").type()
+          .unionOf() // U1
+          .record("Foo").fields().name("fooChildMaybe").type() // R2
+            .record("OptionalUnionHolder").fields().name("value").type() // R3
+              .unionOf() // U2
+              .nullType().and() //
+              .type("Foo").and() //
+              .record("Bar").fields().name("barChildMaybe").type("OptionalUnionHolder").noDefault().endRecord() //
+              .endUnion() // U2
+            .noDefault().endRecord() // U3
+          .noDefault().endRecord() // R2
+          .and() //
+          .type("Bar") //
+          .endUnion().noDefault() // U1
+        .endRecord(); // R1
+
+    Schema reader = SchemaBuilder.record("UnionHolder") // R1
+      .fields() //
+      .name("value").type()
+      .unionOf() // U1
+      .record("Foo").fields().name("fooChildMaybe").type() // R2
+      .record("OptionalUnionHolder").fields().name("value").type() // R3
+      .unionOf() // U2
+      .nullType().and() //
+      .type("Foo").and() //
+      .record("Bar").fields().name("barChildMaybe").notValidatingDefaults().type("OptionalUnionHolder").withDefault(Collections.singletonMap("value", null)).endRecord() //
+      .endUnion() // U2
+      .noDefault().endRecord() // R3
+      .noDefault().endRecord() // R2
+      .and() //
+      .type("Bar") //
+      .endUnion().noDefault() // U1
+      .endRecord(); // R1
+
+
+    Record data = new GenericData.Record(writer);
+    Record optionalUnionHolder = new GenericData.Record(writer.getField("value").schema().getTypes().get(0).getField("fooChildMaybe").schema());
+    optionalUnionHolder.put("value", null);
+    Record fooRecord = new GenericData.Record(writer.getField("value").schema().getTypes().get(0));
+    fooRecord.put("fooChildMaybe", optionalUnionHolder);
+    data.put("value", fooRecord);
+
+    byte[] encoded = encodeGenericBlob(data);
+    GenericData.Record decoded = decodeGenericBlob(reader, writer, encoded);
+    GenericData.Record foo = (GenericData.Record) decoded.get("value");
+    GenericData.Record fooChildMaybe = (GenericData.Record) foo.get("fooChildMaybe");
+    assertNull(fooChildMaybe.get("value"));
   }
 
   private <T> Record defaultRecordWithSchema(Schema schema, String key, T value) {
