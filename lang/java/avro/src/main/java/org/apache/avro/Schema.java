@@ -1659,7 +1659,7 @@ public abstract class Schema extends JsonProperties implements Serializable {
 
   private static final ThreadLocal<Boolean> VALIDATE_DEFAULTS = ThreadLocalWithInitial.of(() -> true);
 
-  private static JsonNode validateDefault(String fieldName, Schema schema, JsonNode defaultValue) {
+  static JsonNode validateDefault(String fieldName, Schema schema, JsonNode defaultValue) {
     if (VALIDATE_DEFAULTS.get() && (defaultValue != null) && !isValidDefault(schema, defaultValue)) { // invalid default
       String message = "Invalid default for field " + fieldName + ": " + defaultValue + " not a " + schema;
       throw new AvroTypeException(message); // throw exception

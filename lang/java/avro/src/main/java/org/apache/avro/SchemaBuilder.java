@@ -17,6 +17,11 @@
  */
 package org.apache.avro;
 
+import com.fasterxml.jackson.core.io.JsonStringEncoder;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.NullNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import java.io.IOException;
 import java.nio.Buffer;
 import java.nio.ByteBuffer;
@@ -26,21 +31,15 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-
-import com.fasterxml.jackson.core.io.JsonStringEncoder;
 import org.apache.avro.Schema.Field;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.util.internal.JacksonUtils;
-
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.NullNode;
-import com.fasterxml.jackson.databind.node.TextNode;
 
 /**
  * <p>
@@ -883,6 +882,48 @@ public class SchemaBuilder {
   }
 
   /**
+   * Holds information about a field default that needs validation after the
+   * complete schema is built. Used for self-referential schemas where the field's
+   * type may not be fully initialized during building.
+   */
+  private static class DeferredValidation {
+    final String fieldName;
+    final Schema fieldSchema;
+    final JsonNode defaultValue;
+
+    DeferredValidation(String fieldName, Schema fieldSchema, JsonNode defaultValue) {
+      this.fieldName = fieldName;
+      this.fieldSchema = fieldSchema;
+      this.defaultValue = defaultValue;
+    }
+  }
+
+  /**
+   * Checks if a schema contains a reference to any incomplete record. An
+   * incomplete record is one that has been created but hasn't had its fields set
+   * yet.
+   */
+  private static boolean containsUnendedRecord(Schema schema, Set<Schema> incompleteRecords) {
+    switch (schema.getType()) {
+    case RECORD:
+      return incompleteRecords.contains(schema);
+    case ARRAY:
+      return containsUnendedRecord(schema.getElementType(), incompleteRecords);
+    case MAP:
+      return containsUnendedRecord(schema.getValueType(), incompleteRecords);
+    case UNION:
+      for (Schema type : schema.getTypes()) {
+        if (containsUnendedRecord(type, incompleteRecords)) {
+          return true;
+        }
+      }
+      return false;
+    default:
+      return false;
+    }
+  }
+
+  /**
    * internal class for passing the naming context around. This allows for the
    * following:
    * <li>Cache and re-use primitive schemas when they do not set properties.</li>
@@ -890,7 +931,7 @@ public class SchemaBuilder {
    * does).</li>
    * <li>Allow previously defined named types or primitive types to be referenced
    * by name.</li>
-   **/
+   */
   private static class NameContext {
     private static final Set<String> PRIMITIVES = new HashSet<>();
     static {
@@ -905,10 +946,16 @@ public class SchemaBuilder {
     }
     private final HashMap<String, Schema> schemas;
     private final String namespace;
+    private final Set<Schema> unendedRecords;
+    private final List<DeferredValidation> deferredValidations;
+    private int recordNestingLevel;
 
     private NameContext() {
       this.schemas = new HashMap<>();
       this.namespace = null;
+      this.unendedRecords = Collections.newSetFromMap(new IdentityHashMap<>());
+      this.deferredValidations = new ArrayList<>();
+      this.recordNestingLevel = 0;
       schemas.put("null", Schema.create(Schema.Type.NULL));
       schemas.put("boolean", Schema.create(Schema.Type.BOOLEAN));
       schemas.put("int", Schema.create(Schema.Type.INT));
@@ -919,13 +966,17 @@ public class SchemaBuilder {
       schemas.put("string", Schema.create(Schema.Type.STRING));
     }
 
-    private NameContext(HashMap<String, Schema> schemas, String namespace) {
+    private NameContext(HashMap<String, Schema> schemas, String namespace, Set<Schema> unendedRecords,
+        List<DeferredValidation> deferredValidations, int recordNestingLevel) {
       this.schemas = schemas;
       this.namespace = "".equals(namespace) ? null : namespace;
+      this.unendedRecords = unendedRecords;
+      this.deferredValidations = deferredValidations;
+      this.recordNestingLevel = recordNestingLevel;
     }
 
     private NameContext namespace(String namespace) {
-      return new NameContext(schemas, namespace);
+      return new NameContext(schemas, namespace, unendedRecords, deferredValidations, recordNestingLevel);
     }
 
     private Schema get(String name, String namespace) {
@@ -946,6 +997,9 @@ public class SchemaBuilder {
         throw new SchemaParseException("Can't redefine: " + fullName);
       }
       schemas.put(fullName, schema);
+
+      unendedRecords.add(schema);
+      recordNestingLevel++;
     }
 
     private String resolveName(String name, String space) {
@@ -962,6 +1016,38 @@ public class SchemaBuilder {
         }
       }
       return name;
+    }
+
+    /**
+     * Mark a record as ended (fields have been set), decrement nesting level, and
+     * if we've reached the top level, validate any deferred fields.
+     */
+    private void markRecordEnded(Schema record) {
+      unendedRecords.remove(record);
+      recordNestingLevel--;
+
+      // If we've completed the top-level schema, validate all deferred fields
+      if (recordNestingLevel == 0 && !deferredValidations.isEmpty()) {
+        for (DeferredValidation deferred : deferredValidations) {
+          Schema.validateDefault(deferred.fieldName, deferred.fieldSchema, deferred.defaultValue);
+        }
+        deferredValidations.clear();
+      }
+    }
+
+    /**
+     * Check if validation should be deferred for a field with this schema.
+     */
+    private boolean shouldDeferValidation(Schema schema) {
+      return containsUnendedRecord(schema, unendedRecords);
+    }
+
+    /**
+     * Add a field default validation to be deferred until schema construction
+     * completes.
+     */
+    private void addDeferredValidation(String fieldName, Schema fieldSchema, JsonNode defaultValue) {
+      deferredValidations.add(new DeferredValidation(fieldName, fieldSchema, defaultValue));
     }
   }
 
@@ -2125,6 +2211,7 @@ public class SchemaBuilder {
      */
     public R endRecord() {
       record.setFields(fields);
+      names.markRecordEnded(record);
       return context.complete(record);
     }
 
@@ -2255,7 +2342,13 @@ public class SchemaBuilder {
     }
 
     private FieldAssembler<R> completeField(Schema schema, JsonNode defaultVal) {
-      Field field = new Field(name(), schema, doc(), defaultVal, validatingDefaults, order);
+      boolean shouldValidate = validatingDefaults;
+      if (defaultVal != null && validatingDefaults && names().shouldDeferValidation(schema)) {
+        names().addDeferredValidation(name(), schema, defaultVal);
+        shouldValidate = false;
+      }
+
+      Field field = new Field(name(), schema, doc(), defaultVal, shouldValidate, order);
       addPropsTo(field);
       addAliasesTo(field);
       return fields.addField(field);
