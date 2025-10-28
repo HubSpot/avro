@@ -392,12 +392,14 @@ public class TestReadingWritingDataInEvolvedSchemas {
 
   @Test
   public void aliasesInSchema() throws Exception {
-    Schema writer = new Schema.Parser()
-        .parse("{\"namespace\": \"example.avro\", \"type\": \"record\", \"name\": \"User\", \"fields\": ["
-            + "{\"name\": \"name\", \"type\": \"int\"}\n" + "]}\n");
-    Schema reader = new Schema.Parser()
-        .parse("{\"namespace\": \"example.avro\", \"type\": \"record\", \"name\": \"User\", \"fields\": ["
-            + "{\"name\": \"fname\", \"type\": \"int\", \"aliases\" : [ \"name\" ]}\n" + "]}\n");
+    Schema writer = SchemaBuilder.record("example.avro.User") //
+        .fields() //
+        .name("name").type().intType().noDefault() //
+        .endRecord();
+    Schema reader = SchemaBuilder.record("example.avro.User") //
+        .fields() //
+        .name("fname").aliases("name").type().intType().noDefault() //
+        .endRecord();
 
     GenericData.Record record = defaultRecordWithSchema(writer, "name", 1);
     byte[] encoded = encodeGenericBlob(record);
@@ -406,8 +408,104 @@ public class TestReadingWritingDataInEvolvedSchemas {
     assertEquals(1, decoded.get("fname"));
   }
 
+  private static final Schema SELF_REFERENCING_NO_DEFAULTS = SchemaBuilder.record("UnionHolder") // R1
+    .fields() //
+    .name("value").type().unionOf() // U1
+    .record("Foo").fields() // R2
+    .name("fooChildMaybe").type().record("OptionalUnionHolder").fields().name("optionalValue").type() // R3
+    .unionOf() // U2
+    .nullType().and() //
+    .type("Foo").and() //
+    .record("Bar").fields() // R4
+    .name("barChildMaybe").type("OptionalUnionHolder").noDefault().name("barStr").type().stringType().noDefault()
+    .endRecord() // R4 end
+    .endUnion().noDefault() // U2 end
+    .name("fooInt").type().intType().noDefault() //
+    .endRecord() // R3 end
+    .noDefault().endRecord() // R2 end
+    .and() //
+    .type("Bar").endUnion().noDefault() // U1 end
+    .endRecord(); // R1 end
+
+  private static final Schema SELF_REFERENCING_ONE_DEFAULT = SchemaBuilder.record("UnionHolder") // R1
+    .fields() //
+    .name("value").type().unionOf() // U1
+    .record("Foo").fields() // R2
+    .name("newFooChildMaybe").aliases("fooChildMaybe").type() // **difference: renamed field**
+    .record("OptionalUnionHolder").fields().name("optionalValue").type() // R3
+    .unionOf() // U2
+    .nullType().and() //
+    .type("Foo").and() //
+    .record("Bar").fields() // R4
+    // **difference: renamed field, added default**
+    .name("newBarChildMaybe").aliases("barChildMaybe").type("OptionalUnionHolder").withDefault(Collections.singletonMap("optionalValue", null))
+    .name("barStr").type().stringType().noDefault().endRecord() // R4 end
+    .endUnion().noDefault() // U2 end
+    .name("fooInt").type().intType().noDefault() //
+    .endRecord() // R3 end
+    .noDefault().endRecord() // R2 end
+    .and() //
+    .type("Bar").endUnion().noDefault() // U1 end
+    .endRecord(); // R1 end
+
+  private static final GenericRecord RECORD_DEFAULT = new GenericRecord() {
+    @Override
+    public void put(String key, Object v) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public Object get(String key) {
+      if ("optionalValue".equals(key)) {
+        return null;
+      }
+
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void put(int i, Object v) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public Object get(int i) {
+      if (i == 0) {
+        return null;
+      }
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public Schema getSchema() {
+      return Schema.createRecord("OptionalUnionHolder", null, null, false);
+    }
+  };
+
+  private static final Schema SELF_REFERENCING_TWO_DEFAULTS = SchemaBuilder.record("UnionHolder") // R1
+    .fields() //
+    .name("value").type().unionOf() // U1
+    .record("Foo").fields() // R2
+    .name("newFooChildMaybe").aliases("fooChildMaybe").type() // **difference: renamed field**
+    .record("OptionalUnionHolder").fields().name("optionalValue").type() // R3
+    .unionOf() // U2
+    .nullType().and() //
+    .type("Foo").and() //
+    .record("Bar").fields() // R4
+    // **difference: renamed field, added default**
+    .name("newBarChildMaybe").aliases("barChildMaybe").type("OptionalUnionHolder").withDefault(Collections.singletonMap("optionalValue", null))
+    .name("barStr").type().stringType().noDefault().endRecord() // R4 end
+    .endUnion().noDefault() // U2 end
+    .name("fooInt").type().intType().noDefault() //
+    .endRecord() // R3 end
+    // >>>> next line is what fails, Schema fields not set yet <<<
+    .recordDefault(RECORD_DEFAULT).endRecord() // R2 end
+    .and() //
+    .type("Bar").endUnion().noDefault() // U1 end
+    .endRecord(); // R1 end
+
   @Test
-  public void aliasesAndDefaultsInSelfReferencingSchema() throws Exception {
+  public void selfReferencingRecordWrittenWithNonDefaultedUnionBranchCanBeReadIfObjectDefaultAddedToOtherUnionBranch() throws Exception {
     Schema writer = SchemaBuilder.record("UnionHolder") // R1
         .fields() //
         .name("value").type().unionOf() // U1
@@ -437,8 +535,8 @@ public class TestReadingWritingDataInEvolvedSchemas {
         .nullType().and() //
         .type("Foo").and() //
         .record("Bar").fields() // R4
-        // **difference: added default**
-        .name("barChildMaybe").type("OptionalUnionHolder").withDefault(Collections.singletonMap("optionalValue", null))
+        // **difference: renamed field, added default**
+        .name("newBarChildMaybe").aliases("barChildMaybe").type("OptionalUnionHolder").withDefault(Collections.singletonMap("optionalValue", null))
         .name("barStr").type().stringType().noDefault().endRecord() // R4 end
         .endUnion().noDefault() // U2 end
         .name("fooInt").type().intType().noDefault() //
@@ -464,6 +562,17 @@ public class TestReadingWritingDataInEvolvedSchemas {
     assertNull(fooChildMaybe.get("optionalValue"));
     assertEquals(1, fooChildMaybe.get("fooInt"));
   }
+
+  @Test
+  public void selfReferencingRecordWrittenWithNonDefaultedUnionBranchCanBeReadIfObjectDefaultAddedToSameUnionBranch() throws Exception {
+
+  }
+
+  @Test
+  public void selfReferencingRecordWrittenWithNullableObjectDefaultedUnionBranchesCanBeReadIfBranchesBecomeRequired() throws Exception {}
+
+  @Test
+  public void selfReferencingRecordWrittenWithRequiredUnionBranchesCanBeReadIfChangedToNullableObjectDefaulted() throws Exception {}
 
   private <T> Record defaultRecordWithSchema(Schema schema, String key, T value) {
     Record data = new GenericData.Record(schema);
